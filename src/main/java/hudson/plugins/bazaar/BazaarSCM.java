@@ -22,14 +22,7 @@ import hudson.scm.SCM;
 import hudson.util.ArgumentListBuilder;
 import hudson.util.FormValidation;
 
-import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.PrintStream;
-import java.io.PrintWriter;
-import java.io.Serializable;
-import java.io.StringWriter;
+import java.io.*;
 import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -59,17 +52,19 @@ public class BazaarSCM extends SCM implements Serializable {
     private final boolean clean;
     private final BazaarRepositoryBrowser browser;
     private final boolean checkout;
+    private final String checkoutTriggerPath;
 
     @DataBoundConstructor
-    public BazaarSCM(String source, boolean clean, BazaarRepositoryBrowser browser, boolean checkout) {
+    public BazaarSCM(String source, boolean clean, BazaarRepositoryBrowser browser, boolean checkout, String checkoutTriggerPath) {
         this.source = source;
         this.clean = clean;
         this.browser = browser;
         this.checkout = checkout;
+        this.checkoutTriggerPath = checkoutTriggerPath;
     }
 
     public BazaarSCM(String source, boolean clean, BazaarRepositoryBrowser browser) {
-        this(source, clean, browser, false);
+        this(source, clean, browser, false, "");
     }
 
     /**
@@ -101,6 +96,10 @@ public class BazaarSCM extends SCM implements Serializable {
     @Exported
     public BazaarRepositoryBrowser getBrowser() {
         return browser;
+    }
+
+    public String getCheckoutTriggerPath() {
+        return checkoutTriggerPath;
     }
 
     private BazaarRevisionState getRevisionState(Launcher launcher, TaskListener listener, String root)
@@ -154,12 +153,20 @@ public class BazaarSCM extends SCM implements Serializable {
         return rev;
     }
 
+    private void getSourceLog(Launcher launcher, FilePath workspace, BazaarRevisionState oldRevisionState, BazaarRevisionState newRevisionState, File changeLog) throws InterruptedException {
+        getBranchLog(launcher, workspace, oldRevisionState, newRevisionState, changeLog, source);
+    }
+
     private void getLog(Launcher launcher, FilePath workspace, BazaarRevisionState oldRevisionState, BazaarRevisionState newRevisionState, File changeLog) throws InterruptedException {
+        getBranchLog(launcher, workspace, oldRevisionState, newRevisionState, changeLog, "");
+    }
+
+    private void getBranchLog(Launcher launcher, FilePath workspace, BazaarRevisionState oldRevisionState, BazaarRevisionState newRevisionState, File changeLog, String branch) throws InterruptedException {
         try {
             int ret;
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             String version = "revid:" + oldRevisionState.getRevId() + "..revid:" + newRevisionState.getRevId();
-            if ((ret = launcher.launch().cmds(getDescriptor().getBzrExe(), "log", "-v", "-r", version, "--long", "--show-ids")
+            if ((ret = launcher.launch().cmds(getDescriptor().getBzrExe(), "log", "-v", "-r", version, "--long", "--show-ids", branch)
                     .envs(EnvVars.masterEnvVars).stdout(baos).pwd(workspace).join()) != 0) {
                 logger.log(Level.WARNING, "bzr log -v -r returned {0}", ret);
             } else {
@@ -185,15 +192,40 @@ public class BazaarSCM extends SCM implements Serializable {
         output.println(remote);
         final Change change;
         output.printf("Baseline is %s.\n", baseline);
+
         if ((baseline == SCMRevisionState.NONE)
             // appears that other instances of None occur - its not a singleton.
             // so do a (fugly) class check.
             || (baseline.getClass() != BazaarRevisionState.class)
-            || (!remote.equals(baseline)))
+            || (!remote.equals(baseline) && isTriggerPathAffected(launcher, workspace, listener, (BazaarRevisionState) baseline, remote)))
             change = Change.SIGNIFICANT;
         else
             change = Change.NONE;
         return new PollingResult(baseline,remote,change);
+    }
+
+    private Boolean isTriggerPathAffected(Launcher launcher, FilePath workspace, TaskListener listener, BazaarRevisionState baseline, BazaarRevisionState remote) throws IOException, InterruptedException
+    {
+        if (checkoutTriggerPath.length() == 0) {
+            return true;
+        }
+
+        if (launcher == null) {
+            launcher = new LocalLauncher(listener);
+        }
+        // TODO: write log into a string
+        File changeLog = File.createTempFile("bzrlog", null);
+        getSourceLog(launcher, workspace, baseline, remote, changeLog);
+        BazaarChangeSetList changeSetList = new BazaarChangeLogParser().parse(null, changeLog);
+        changeLog.delete();
+        for (BazaarChangeSet changeSet : changeSetList) {
+            for (String path : changeSet.getAffectedPaths()) {
+                if (path.matches(checkoutTriggerPath)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     @Override
